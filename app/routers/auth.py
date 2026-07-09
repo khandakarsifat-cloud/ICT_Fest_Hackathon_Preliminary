@@ -1,5 +1,8 @@
 """Authentication endpoints: register, login, refresh, logout."""
+import threading
+
 from fastapi import APIRouter, Depends
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -8,6 +11,7 @@ from ..auth import (
     decode_token,
     get_token_payload,
     hash_password,
+    mark_refresh_token_used,
     revoke_access_token,
     verify_password,
 )
@@ -17,46 +21,47 @@ from ..models import Organization, User
 from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+_register_lock = threading.Lock()
 
 
 @router.post("/register", status_code=201)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    org = db.query(Organization).filter(Organization.name == payload.org_name).first()
-    role = "admin" if org is None else "member"
-    if org is None:
-        org = Organization(name=payload.org_name)
-        db.add(org)
-        db.commit()
-        db.refresh(org)
+    with _register_lock:
+        org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+        role = "admin" if org is None else "member"
+        if org is None:
+            org = Organization(name=payload.org_name)
+            db.add(org)
+            db.commit()
+            db.refresh(org)
 
-    existing = (
-        db.query(User)
-        .filter(User.org_id == org.id, User.username == payload.username)
-        .first()
-    )
-    if existing is not None:
+        existing = (
+            db.query(User)
+            .filter(User.org_id == org.id, User.username == payload.username)
+            .first()
+        )
+        if existing is not None:
+            raise AppError(409, "USERNAME_TAKEN", "Username already exists in this organization")
+
+        user = User(
+            org_id=org.id,
+            username=payload.username,
+            hashed_password=hash_password(payload.password),
+            role=role,
+        )
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise AppError(409, "USERNAME_TAKEN", "Username already exists in this organization")
+        db.refresh(user)
         return {
-            "user_id": existing.id,
+            "user_id": user.id,
             "org_id": org.id,
-            "username": existing.username,
-            "role": existing.role,
+            "username": user.username,
+            "role": user.role,
         }
-
-    user = User(
-        org_id=org.id,
-        username=payload.username,
-        hashed_password=hash_password(payload.password),
-        role=role,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return {
-        "user_id": user.id,
-        "org_id": org.id,
-        "username": user.username,
-        "role": user.role,
-    }
 
 
 @router.post("/login")
@@ -83,6 +88,7 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    mark_refresh_token_used(data)
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
