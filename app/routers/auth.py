@@ -13,6 +13,7 @@ from ..auth import (
     hash_password,
     mark_refresh_token_used,
     revoke_access_token,
+    validate_token_payload,
     verify_password,
 )
 from ..database import get_db
@@ -85,12 +86,10 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 @router.post("/refresh")
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
-    data = decode_token(payload.refresh_token)
-    if data.get("type") != "refresh":
-        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    data = validate_token_payload(decode_token(payload.refresh_token), "refresh")
     mark_refresh_token_used(data)
     user = db.query(User).filter(User.id == int(data["sub"])).first()
-    if user is None:
+    if user is None or user.org_id != int(data["org"]) or user.role != data["role"]:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
     return {
         "access_token": create_access_token(user),

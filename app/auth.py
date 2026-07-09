@@ -27,6 +27,9 @@ _used_refresh_tokens: set[str] = set()
 _token_state_lock = threading.Lock()
 
 _PBKDF2_ROUNDS = 100_000
+_REQUIRED_TOKEN_CLAIMS = {"sub", "org", "role", "jti", "iat", "exp", "type"}
+_VALID_TOKEN_TYPES = {"access", "refresh"}
+_VALID_ROLES = {"admin", "member"}
 
 
 def hash_password(password: str) -> str:
@@ -85,12 +88,50 @@ def decode_token(token: str) -> dict:
         raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
 
 
+def _int_claim(payload: dict, claim: str) -> int:
+    try:
+        value = payload[claim]
+        if isinstance(value, bool):
+            raise ValueError
+        return int(value)
+    except (KeyError, TypeError, ValueError):
+        raise AppError(401, "UNAUTHORIZED", "Invalid token claims")
+
+
+def validate_token_payload(payload: dict, expected_type: str | None = None) -> dict:
+    if not isinstance(payload, dict):
+        raise AppError(401, "UNAUTHORIZED", "Invalid token claims")
+
+    if _REQUIRED_TOKEN_CLAIMS - payload.keys():
+        raise AppError(401, "UNAUTHORIZED", "Invalid token claims")
+
+    token_type = payload.get("type")
+    if token_type not in _VALID_TOKEN_TYPES:
+        raise AppError(401, "UNAUTHORIZED", "Invalid token type")
+    if expected_type is not None and token_type != expected_type:
+        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+
+    _int_claim(payload, "sub")
+    _int_claim(payload, "org")
+    _int_claim(payload, "iat")
+    _int_claim(payload, "exp")
+
+    if payload.get("role") not in _VALID_ROLES:
+        raise AppError(401, "UNAUTHORIZED", "Invalid token role")
+    if not isinstance(payload.get("jti"), str) or not payload["jti"]:
+        raise AppError(401, "UNAUTHORIZED", "Invalid token claims")
+
+    return payload
+
+
 def revoke_access_token(payload: dict) -> None:
+    validate_token_payload(payload, "access")
     with _token_state_lock:
         _revoked_tokens.add(payload["jti"])
 
 
 def mark_refresh_token_used(payload: dict) -> None:
+    validate_token_payload(payload, "refresh")
     jti = payload.get("jti")
     if not jti:
         raise AppError(401, "UNAUTHORIZED", "Invalid refresh token")
@@ -105,9 +146,7 @@ def get_token_payload(request: Request) -> dict:
     if not header or not header.startswith("Bearer "):
         raise AppError(401, "UNAUTHORIZED", "Missing bearer token")
     token = header[len("Bearer "):].strip()
-    payload = decode_token(token)
-    if payload.get("type") != "access":
-        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    payload = validate_token_payload(decode_token(token), "access")
     with _token_state_lock:
         if payload.get("jti") in _revoked_tokens:
             raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
@@ -118,8 +157,10 @@ def get_current_user(
     payload: dict = Depends(get_token_payload),
     db: Session = Depends(get_db),
 ) -> User:
-    user = db.query(User).filter(User.id == int(payload["sub"])).first()
-    if user is None:
+    user_id = _int_claim(payload, "sub")
+    org_id = _int_claim(payload, "org")
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None or user.org_id != org_id or user.role != payload.get("role"):
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
     return user
 

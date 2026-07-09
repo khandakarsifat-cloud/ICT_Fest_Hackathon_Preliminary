@@ -13,19 +13,19 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`.
 ## Authentication and token issues
 
 - status: tested
-  file/location: `app/auth.py:51`, `create_access_token`
+  file/location: `app/auth.py:54`, `create_access_token`
   wrong behavior: access lifetime was 900 minutes instead of 900 seconds.
   violated rule: access token `exp - iat` must be exactly 900 seconds.
   fix plan: issue access tokens with a 900-second lifetime; verified by JWT decode test.
 
 - status: tested
-  file/location: `app/auth.py:103`, `get_token_payload`
+  file/location: `app/auth.py:144`, `get_token_payload`
   wrong behavior: logout stored token `jti` but blacklist lookup checked `sub`.
   violated rule: logout must immediately invalidate the presented access token.
   fix plan: check the access token `jti` against the revoked-token set; verified by logout reuse test.
 
 - status: tested
-  file/location: `app/auth.py:93`, `app/routers/auth.py:87`, refresh handling
+  file/location: `app/auth.py:133`, `app/routers/auth.py:88`, refresh handling
   wrong behavior: refresh tokens could be reused.
   violated rule: refresh tokens are single-use.
   fix plan: store used refresh token `jti`s behind a lock and mark a token used before issuing new tokens; verified by refresh reuse test.
@@ -35,6 +35,12 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`.
   wrong behavior: duplicate username within an org returned the existing user.
   violated rule: duplicate username within org must return `409 USERNAME_TAKEN`.
   fix plan: raise `USERNAME_TAKEN` and serialize registration writes; verified by duplicate registration test.
+
+- status: tested
+  file/location: `app/auth.py:101`, `app/auth.py:144`, `app/routers/auth.py:88`
+  wrong behavior: validly signed JWTs with missing or malformed required claims could crash as `500` or be trusted too far.
+  violated rule: missing, malformed, expired, invalid, blacklisted/revoked, or wrong-type tokens must return `401 UNAUTHORIZED`; JWTs require `sub`, `org`, `role`, `jti`, `iat`, `exp`, and `type`.
+  fix plan: add `validate_token_payload(payload, expected_type)` and use it for access dependencies, logout, refresh, and current-user lookup; verified by malformed signed access/refresh token tests.
 
 ## Booking window, pricing, conflict, quota, and rate-limit issues
 
@@ -67,6 +73,12 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`.
   wrong behavior: shared bucket update was not locked.
   violated rule: rolling rate limit must hold under concurrent requests and count all attempts.
   fix plan: lock trim/count/append/check; covered by full suite import and code review, with concurrency pattern matching booking locks.
+
+- status: tested
+  file/location: `app/routers/bookings.py:114`
+  wrong behavior: the 3-booking quota applied to admins as well as members.
+  violated rule: the quota says "A member may hold at most 3 confirmed bookings" and does not apply to admins.
+  fix plan: call `_check_quota` only when `user.role == "member"`; verified by member quota and admin exemption tests.
 
 - status: tested
   file/location: `app/models.py:55`, `app/services/reference.py:5`
@@ -111,13 +123,13 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`.
 ## Pagination, reporting, availability, stats, export issues
 
 - status: tested
-  file/location: `app/routers/bookings.py:143`, `list_bookings`
+  file/location: `app/routers/bookings.py:147`, `list_bookings`
   wrong behavior: descending order, offset by `page * limit`, hardcoded limit 10.
   violated rule: ascending `start_time`, tie by `id`, offset `(page-1)*limit`, respect `limit`.
   fix plan: update ordering, offset, and limit; verified by pagination test.
 
 - status: tested
-  file/location: `app/routers/bookings.py:166`, `get_booking`
+  file/location: `app/routers/bookings.py:170`, `get_booking`
   wrong behavior: response overwrote `start_time` with `created_at`.
   violated rule: booking response field names must contain actual booking values.
   fix plan: remove overwrite; covered by booking detail/refund test.
@@ -133,6 +145,12 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`.
   wrong behavior: stats were in-memory counters and reset/drift under restart/concurrency.
   violated rule: room stats must equal current confirmed bookings and revenue from DB.
   fix plan: derive stats with a DB aggregate query; verified by create/cancel stats tests.
+
+- status: tested
+  file/location: `app/services/stats.py:1`
+  wrong behavior: the unused stats service still claimed in-memory counters were the stats source of truth.
+  violated rule: stats must be DB-derived and current.
+  fix plan: remove stale counter logic and leave a package-layout compatibility note; verified by stats endpoint tests and import checks.
 
 - status: tested
   file/location: `app/routers/bookings.py:80`, create/cancel invalidation

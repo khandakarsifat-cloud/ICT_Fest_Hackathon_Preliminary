@@ -9,17 +9,17 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`. The API c
 
 ## Authentication And Token Issues
 
-- `app/auth.py:51` - access token lifetime used `ACCESS_TOKEN_EXPIRE_MINUTES * 60` minutes, producing 900-minute access tokens.
+- `app/auth.py:54` - access token lifetime used `ACCESS_TOKEN_EXPIRE_MINUTES * 60` minutes, producing 900-minute access tokens.
   - Rule violated: access token `exp - iat` must be exactly 900 seconds.
   - Fix: use `timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)`.
   - Verification: `test_auth_lifetime_logout_refresh_and_duplicate_registration` decodes the JWT and asserts `exp - iat == 900`.
 
-- `app/auth.py:103` - logout stored revoked access token `jti`, but auth checked `sub` against the revoked set.
+- `app/auth.py:144` - logout stored revoked access token `jti`, but auth checked `sub` against the revoked set.
   - Rule violated: logout must immediately invalidate the presented access token.
   - Fix: check payload `jti` under a token-state lock.
   - Verification: same auth regression test logs out and confirms subsequent access returns `401`.
 
-- `app/auth.py:93`, `app/routers/auth.py:87` - refresh tokens were reusable.
+- `app/auth.py:133`, `app/routers/auth.py:88` - refresh tokens were reusable.
   - Rule violated: refresh tokens are single-use; reuse must return `401`.
   - Fix: added locked used-refresh-`jti` tracking and mark the presented refresh token used before issuing replacements.
   - Verification: same auth regression test refreshes once successfully and confirms reuse returns `401`.
@@ -28,6 +28,11 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`. The API c
   - Rule violated: duplicate username within org must return `409 USERNAME_TAKEN`.
   - Fix: raise `AppError(409, "USERNAME_TAKEN", ...)`; serialize registration writes and handle uniqueness failures.
   - Verification: duplicate registration API test asserts `409 USERNAME_TAKEN`.
+
+- `app/auth.py:101`, `app/auth.py:144`, `app/routers/auth.py:88` - JWT payloads were decoded but not fully validated before use.
+  - Rule violated: missing, malformed, expired, invalid, revoked, or wrong-type tokens must return `401 UNAUTHORIZED`; required claims are `sub`, `org`, `role`, `jti`, `iat`, `exp`, and `type`.
+  - Fix: added `validate_token_payload(payload, expected_type)` and use it for access-token dependencies, logout, refresh, and current-user lookup. `sub`, `org`, `iat`, and `exp` must be integer-convertible, `role` must be `admin` or `member`, and `type` must be `access` or `refresh`.
+  - Verification: malformed signed access/refresh token regression tests assert `401 UNAUTHORIZED` for missing `sub`, missing `jti`, missing `type`, missing required claims, malformed `sub`, invalid `role`, and wrong token type.
 
 ## Booking Window, Pricing, Conflict, Quota, And Rate-Limit Issues
 
@@ -54,7 +59,12 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`. The API c
 - `app/services/ratelimit.py:20` - rolling-window bucket updates were unsynchronized.
   - Rule violated: rate limit must hold under concurrent requests and count all attempts.
   - Fix: lock trim/append/check.
-  - Verification: covered by import/full-suite execution; implementation now has one atomic critical section.
+  - Verification: rate-limit regression confirms admins and members both receive `429 RATE_LIMITED` on the 21st booking request in the rolling window.
+
+- `app/routers/bookings.py:114` - member quota was applied to admins too.
+  - Rule violated: the quota applies to members only: "A member may hold at most 3 confirmed bookings..."
+  - Fix: call `_check_quota` only when `user.role == "member"`.
+  - Verification: member's 4th booking within 24 hours returns `409 QUOTA_EXCEEDED`; admin can create more than 3 non-conflicting bookings in the same window.
 
 - `app/models.py:55`, `app/services/reference.py:5` - reference codes came from a resettable, unlocked in-memory counter and the DB column was not unique.
   - Rule violated: every booking reference code is unique, including under concurrency.
@@ -92,12 +102,12 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`. The API c
 
 ## Pagination, Reporting, Availability, Stats, Export Issues
 
-- `app/routers/bookings.py:143` - listing sorted descending, used `offset(page * limit)`, and hardcoded `.limit(10)`.
+- `app/routers/bookings.py:147` - listing sorted descending, used `offset(page * limit)`, and hardcoded `.limit(10)`.
   - Rule violated: ascending `start_time`, tie by `id`, page offset `(page - 1) * limit`, respect requested limit.
   - Fix: corrected ordering, offset, and limit.
   - Verification: pagination regression asserts `limit=1` returns the earliest created booking.
 
-- `app/routers/bookings.py:166` - booking detail overwrote `start_time` with `created_at`.
+- `app/routers/bookings.py:170` - booking detail overwrote `start_time` with `created_at`.
   - Rule violated: response field names must contain the actual booking data.
   - Fix: removed the overwrite and kept `serialize_booking()` output.
   - Verification: booking detail/refund regression passes.
@@ -111,6 +121,11 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`. The API c
   - Rule violated: stats must equal current confirmed bookings and revenue derivable from the DB.
   - Fix: compute `count` and `sum(price_cents)` from confirmed bookings in SQL.
   - Verification: stats show 1 after create and 0 after cancel.
+
+- `app/services/stats.py:1` - stale unused code still claimed room stats were maintained with in-memory counters.
+  - Rule violated: stats must remain DB-derived and current; stale source-of-truth wording was inconsistent with the fixed endpoint.
+  - Fix: removed the unused in-memory counter functions and left a package-layout compatibility note.
+  - Verification: syntax/import checks pass and stats endpoint regressions still use the DB-derived router implementation.
 
 - `app/services/export.py:32` - export scoping was inconsistent when `room_id` was supplied.
   - Rule violated: exports are tenant-scoped on every code path.
@@ -144,8 +159,10 @@ Source of truth: `README.md` and `ICT_Fest_Hackathon_Preliminary.pdf`. The API c
 
 ## Verification Summary
 
+- Syntax/import check: `python -m compileall app tests` passed.
+- Docker build check: `docker build -t cowork-bugfix-test .` passed.
 - Existing smoke test first: `docker run --rm cowork-bugfix-test sh -c "pip install --no-cache-dir pytest >/tmp/pip-pytest.log; pytest tests/test_smoke.py -q"` passed.
-- Full regression suite: `docker run --rm cowork-bugfix-test sh -c "pip install --no-cache-dir pytest >/tmp/pip-pytest.log; pytest -q"` passed with `6 passed, 1 warning`.
+- Full regression suite: `docker run --rm cowork-bugfix-test sh -c "pip install --no-cache-dir pytest >/tmp/pip-pytest.log; pytest -q"` passed with `10 passed, 1 warning`.
 - Local Windows venv could not run the app because it is Python 3.14 and `pydantic-core==2.18.2` lacks a compatible wheel, causing a native build failure without MSVC linker tools. Docker uses the challenge's Python 3.11 target and was used for final verification.
 
 ## Remaining Risk / Assumptions

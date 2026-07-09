@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import jwt
@@ -58,6 +58,29 @@ def _book(headers: dict, room_id: int, start: datetime, hours: int = 1):
     )
 
 
+def _signed_token(overrides: dict | None = None, missing: set[str] | None = None) -> str:
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "sub": "1",
+        "org": 1,
+        "role": "admin",
+        "jti": uuid4().hex,
+        "iat": now,
+        "exp": now + 900,
+        "type": "access",
+    }
+    if overrides:
+        payload.update(overrides)
+    for claim in missing or set():
+        payload.pop(claim, None)
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def _assert_unauthorized(response):
+    assert response.status_code == 401, response.text
+    assert response.json()["code"] == "UNAUTHORIZED"
+
+
 def test_auth_lifetime_logout_refresh_and_duplicate_registration():
     org = f"auth-{uuid4().hex}"
     _register_login(org)
@@ -81,6 +104,39 @@ def test_auth_lifetime_logout_refresh_and_duplicate_registration():
     assert logout.status_code == 200
     after_logout = client.get("/rooms", headers=_headers(tokens["access_token"]))
     assert after_logout.status_code == 401
+
+
+def test_malformed_signed_access_tokens_return_401():
+    cases = [
+        _signed_token({"sub": "abc"}),
+        _signed_token(missing={"sub"}),
+        _signed_token(missing={"jti"}),
+        _signed_token(missing={"type"}),
+        _signed_token({"type": "nonsense"}),
+        _signed_token({"role": "owner"}),
+        _signed_token(missing={"org"}),
+        _signed_token(missing={"iat"}),
+        _signed_token(missing={"exp"}),
+    ]
+    for token in cases:
+        _assert_unauthorized(client.get("/rooms", headers=_headers(token)))
+
+
+def test_malformed_signed_refresh_tokens_return_401():
+    base = {"type": "refresh"}
+    cases = [
+        _signed_token({**base, "sub": "abc"}),
+        _signed_token(base, missing={"sub"}),
+        _signed_token(base, missing={"jti"}),
+        _signed_token(base, missing={"type"}),
+        _signed_token({"type": "access"}),
+        _signed_token({**base, "role": "owner"}),
+        _signed_token(base, missing={"org"}),
+        _signed_token(base, missing={"iat"}),
+        _signed_token(base, missing={"exp"}),
+    ]
+    for token in cases:
+        _assert_unauthorized(client.post("/auth/refresh", json={"refresh_token": token}))
 
 
 def test_booking_window_utc_overlap_back_to_back_and_pagination():
@@ -174,6 +230,68 @@ def test_cancel_refund_amount_and_live_reads():
     report = client.get(f"/admin/usage-report?from={date}&to={date}", headers=headers)
     assert report.status_code == 200
     assert report.json()["rooms"][0]["confirmed_bookings"] == 0
+
+
+def test_member_quota_applies_but_admin_is_exempt():
+    org = f"quota-{uuid4().hex}"
+    _, admin_tokens = _register_login(org, "admin")
+    admin_headers = _headers(admin_tokens["access_token"])
+    room_id = _room(admin_headers)
+
+    _register_login(org, "member")
+    member_login = client.post(
+        "/auth/login",
+        json={"org_name": org, "username": "member", "password": "pw12345"},
+    )
+    member_headers = _headers(member_login.json()["access_token"])
+
+    member_start = _future(1)
+    for hour in range(3):
+        response = _book(member_headers, room_id, member_start + timedelta(hours=hour), 1)
+        assert response.status_code == 201, response.text
+    quota_response = _book(member_headers, room_id, member_start + timedelta(hours=3), 1)
+    assert quota_response.status_code == 409
+    assert quota_response.json()["code"] == "QUOTA_EXCEEDED"
+
+    admin_start = _future(10)
+    for hour in range(4):
+        response = _book(admin_headers, room_id, admin_start + timedelta(hours=hour), 1)
+        assert response.status_code == 201, response.text
+
+
+def test_rate_limit_applies_to_admins_and_members():
+    org = f"ratelimit-{uuid4().hex}"
+    _, admin_tokens = _register_login(org, "admin")
+    admin_headers = _headers(admin_tokens["access_token"])
+    _register_login(org, "member")
+    member_login = client.post(
+        "/auth/login",
+        json={"org_name": org, "username": "member", "password": "pw12345"},
+    )
+    member_headers = _headers(member_login.json()["access_token"])
+
+    def exhaust(headers: dict) -> dict:
+        latest = None
+        for _ in range(21):
+            latest = client.post(
+                "/bookings",
+                json={
+                    "room_id": 999999,
+                    "start_time": _future(72).isoformat(),
+                    "end_time": (_future(73)).isoformat(),
+                },
+                headers=headers,
+            )
+        assert latest is not None
+        return latest.json() | {"status_code": latest.status_code}
+
+    admin_limited = exhaust(admin_headers)
+    assert admin_limited["status_code"] == 429
+    assert admin_limited["code"] == "RATE_LIMITED"
+
+    member_limited = exhaust(member_headers)
+    assert member_limited["status_code"] == 429
+    assert member_limited["code"] == "RATE_LIMITED"
 
 
 def test_cross_org_room_ids_are_not_found_for_export_and_booking_create():
